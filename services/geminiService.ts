@@ -13,7 +13,7 @@ export const generateSpeechSegment = async (
     // Check for API Key at runtime
     const apiKey = process.env.API_KEY;
     if (!apiKey) {
-      throw new Error("API Key not found. Please ensure the environment is configured correctly.");
+      throw new Error("API Key not found. Please add 'API_KEY' to your Netlify Environment Variables and redeploy.");
     }
 
     // Initialize client per request to ensure valid key usage
