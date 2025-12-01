@@ -2,7 +2,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { AudioSegment, SegmentStatus, VOICES, ProjectState } from './types';
 import { generateSpeechSegment, createWavUrl } from './services/geminiService';
 import SegmentList from './components/SegmentList';
-import { Split, PlayCircle, Loader2, Trash2, StopCircle, FileAudio, RotateCcw, Plus, X, FolderOpen, Edit2, Volume2, Square } from 'lucide-react';
+import { Split, PlayCircle, Loader2, Trash2, StopCircle, FileAudio, RotateCcw, Plus, X, FolderOpen, Edit2, Volume2, Square, Settings } from 'lucide-react';
 
 // Maximum characters per chunk (approx 1.5 mins of speech depending on speed)
 const MAX_CHUNK_LENGTH = 1000;
@@ -41,6 +41,11 @@ function App() {
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [editNameText, setEditNameText] = useState("");
 
+  // Global Settings State
+  const [showSettings, setShowSettings] = useState(false);
+  const [apiKeys, setApiKeys] = useState<string[]>([]);
+  const [apiKeyInput, setApiKeyInput] = useState(""); // For the textarea input
+
   // Preview state
   const [previewAudio, setPreviewAudio] = useState<HTMLAudioElement | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
@@ -51,6 +56,33 @@ function App() {
   // Derived state: The currently active project
   const activeProject = projects.find(p => p.id === activeProjectId) || projects[0];
 
+  // Load API Keys from local storage on mount
+  useEffect(() => {
+    const storedKeys = localStorage.getItem('gemini_api_keys');
+    if (storedKeys) {
+        try {
+            const parsed = JSON.parse(storedKeys);
+            if (Array.isArray(parsed)) {
+                setApiKeys(parsed);
+                setApiKeyInput(parsed.join('\n'));
+            }
+        } catch (e) {
+            // Fallback for migration from single key string if needed, or just ignore
+            if (!storedKeys.startsWith('[')) {
+                setApiKeys([storedKeys]);
+                setApiKeyInput(storedKeys);
+            }
+        }
+    } else {
+        // Fallback: check old single key storage
+        const oldKey = localStorage.getItem('gemini_api_key');
+        if (oldKey) {
+            setApiKeys([oldKey]);
+            setApiKeyInput(oldKey);
+        }
+    }
+  }, []);
+
   // Cleanup preview audio on unmount
   useEffect(() => {
     return () => {
@@ -59,6 +91,20 @@ function App() {
       }
     };
   }, [previewAudio]);
+
+  const saveApiKeys = () => {
+      // Split by newline, trim, remove empty lines
+      const keys = apiKeyInput
+        .split('\n')
+        .map(k => k.trim())
+        .filter(k => k.length > 0);
+      
+      setApiKeys(keys);
+      localStorage.setItem('gemini_api_keys', JSON.stringify(keys));
+      // Clean up old single key storage
+      localStorage.removeItem('gemini_api_key');
+      setShowSettings(false);
+  };
 
   // Helper to update a specific project by ID
   const updateProject = (id: string, updates: Partial<ProjectState> | ((prev: ProjectState) => Partial<ProjectState>)) => {
@@ -79,10 +125,8 @@ function App() {
     if (activeProject.hasExported) {
        // We only check if segments actually changed significantly, but for simplicity, 
        // any re-render that might imply a change logic is handled in the handlers usually.
-       // However, since segments is an array, we can't easily detect deep changes in useEffect without deep compare.
-       // Instead, we will call setHasExported(false) in specific handlers (chunk, delete, retry).
     }
-  }, [activeProject.segments]); // This dependency is okay but we'll handle logic in handlers for precision
+  }, [activeProject.segments]); 
 
   // --- PROJECT MANAGEMENT HANDLERS ---
 
@@ -135,14 +179,18 @@ function App() {
 
     setIsPreviewLoading(true);
     try {
-      // Use a fixed Bengali phrase for the preview to judge quality accurately
-      // "Hello, I am your selected voice."
+      // Pick a random key from the list to spread load, or undefined if list empty
+      const keyToUse = apiKeys.length > 0 
+        ? apiKeys[Math.floor(Math.random() * apiKeys.length)] 
+        : undefined;
+
       const previewText = "হ্যালো, আমি আপনার নির্বাচিত ভয়েস।";
       const url = await generateSpeechSegment(
         previewText, 
         activeProject.selectedVoice, 
-        activeProject.styleInstruction, // Use current style to see how it affects voice
-        activeProject.speakingRate
+        activeProject.styleInstruction,
+        activeProject.speakingRate,
+        keyToUse
       );
       
       const audio = new Audio(url);
@@ -154,7 +202,7 @@ function App() {
       setPreviewAudio(audio);
     } catch (error) {
       console.error("Preview failed", error);
-      alert("Could not generate preview. Check API limits or try again.");
+      alert("Could not generate preview. Please check your API Keys in settings.");
     } finally {
       setIsPreviewLoading(false);
     }
@@ -210,23 +258,12 @@ function App() {
   };
 
   const processQueue = useCallback(async (projectIdToRun: string) => {
-    // We need to fetch the fresh state of the project at the start
-    // However, inside the async loop, we need to access the LATEST state or be careful with updates.
-    // Using functional state updates setProjects(prev => ...) is the safest way.
-
-    const getProject = (allProjects: ProjectState[]) => allProjects.find(p => p.id === projectIdToRun);
-
-    // Initial check
     const currentProject = projects.find(p => p.id === projectIdToRun);
     if (!currentProject || currentProject.isProcessing) return;
 
-    // Set processing flag
     updateProject(projectIdToRun, { isProcessing: true });
-    
-    // Reset stop signal
     stopSignalsRef.current[projectIdToRun] = false;
 
-    // Find segments to process
     const segmentsToProcess = currentProject.segments.filter(s => s.status === SegmentStatus.IDLE || s.status === SegmentStatus.QUEUED);
     const total = segmentsToProcess.length;
 
@@ -235,7 +272,6 @@ function App() {
         return;
     }
 
-    // Mark segments as processing VISUALLY
     setProjects(prev => prev.map(p => {
         if (p.id !== projectIdToRun) return p;
         return {
@@ -249,24 +285,28 @@ function App() {
         };
     }));
 
-    // Capture necessary config variables to avoid closure staleness issues
     const { selectedVoice, styleInstruction, speakingRate } = currentProject;
-
-    const CONCURRENCY_LIMIT = 5; 
+    const CONCURRENCY_LIMIT = 2; 
     const executing = new Set<Promise<void>>();
     let completedCount = 0;
+    
+    // Round Robin Key Index
+    let keyIndex = 0;
 
     for (const segment of segmentsToProcess) {
-      // Check stop signal
       if (stopSignalsRef.current[projectIdToRun]) break;
+
+      // Select Key for this specific request
+      const keyToUse = apiKeys.length > 0 
+        ? apiKeys[keyIndex++ % apiKeys.length] 
+        : undefined;
 
       const p = (async () => {
         try {
-            const audioUrl = await generateSpeechSegment(segment.text, selectedVoice, styleInstruction, speakingRate);
+            const audioUrl = await generateSpeechSegment(segment.text, selectedVoice, styleInstruction, speakingRate, keyToUse);
             
             if (stopSignalsRef.current[projectIdToRun]) return;
             
-            // Update segment success
             setProjects(prev => prev.map(p => {
                 if (p.id !== projectIdToRun) return p;
                 return {
@@ -279,7 +319,6 @@ function App() {
             if (stopSignalsRef.current[projectIdToRun]) return;
             
             console.error(`Segment ${segment.id} failed:`, error);
-            // Update segment failure
             setProjects(prev => prev.map(p => {
                 if (p.id !== projectIdToRun) return p;
                 return {
@@ -290,7 +329,6 @@ function App() {
         } finally {
             if (!stopSignalsRef.current[projectIdToRun]) {
                 completedCount++;
-                // Update progress
                 setProjects(prev => prev.map(p => {
                     if (p.id !== projectIdToRun) return p;
                     return { ...p, progress: { ...p.progress, current: completedCount } };
@@ -310,13 +348,12 @@ function App() {
 
     await Promise.all(executing);
 
-    // Finished
     updateProject(projectIdToRun, { 
         isProcessing: false, 
         progress: { current: 0, total: 0 } 
     });
 
-  }, [projects]); // Dependency on projects is heavy, but necessary for the initial read. 
+  }, [projects, apiKeys]); 
 
   const handleStop = () => {
     stopSignalsRef.current[activeProjectId] = true;
@@ -325,7 +362,7 @@ function App() {
 
   const handleClearAll = () => {
     if (activeProject.segments.length > 0) {
-      handleStop(); // Stop current
+      handleStop();
       updateActiveProject({
           segments: [],
           hasExported: false
@@ -338,7 +375,11 @@ function App() {
         hasExported: false,
         segments: prev.segments.map(s => s.id === id ? { ...s, status: SegmentStatus.IDLE, error: undefined } : s)
     }));
-  }, [activeProjectId]); 
+    
+    setTimeout(() => {
+        processQueue(activeProjectId);
+    }, 100);
+  }, [activeProjectId, processQueue]); 
 
   const handleDeleteSegment = useCallback((id: string) => {
     updateActiveProject((prev) => ({
@@ -347,7 +388,6 @@ function App() {
     }));
   }, [activeProjectId]);
 
-  // --- VOLUME & SELECTION HANDLERS ---
   const handleVolumeChange = (id: string, newVolume: number) => {
     updateActiveProject(prev => ({
         segments: prev.segments.map(s => s.id === id ? { ...s, volume: newVolume } : s),
@@ -372,7 +412,6 @@ function App() {
           const hasSelection = prev.segments.some(s => s.isSelected);
           return {
               segments: prev.segments.map(s => {
-                  // If items are selected, only update those. If none selected, update all.
                   if (hasSelection && !s.isSelected) return s; 
                   return { ...s, volume: newVolume };
               }),
@@ -402,26 +441,17 @@ function App() {
         
         if (arrayBuffer.byteLength > 44) {
              const rawData = new Uint8Array(arrayBuffer.slice(44));
-             
-             // Handle volume adjustment if volume is not 1.0 (100%)
-             // 16-bit PCM is signed integer
              const volume = segment.volume !== undefined ? segment.volume : 1.0;
              
              if (Math.abs(volume - 1.0) > 0.01) {
-                // Parse as 16-bit signed integers
                 const int16View = new Int16Array(rawData.buffer, rawData.byteOffset, rawData.byteLength / 2);
-                
-                // Adjust volume
                 for (let i = 0; i < int16View.length; i++) {
                     let val = int16View[i] * volume;
-                    // Hard clipping (clamping) to prevent overflow distortion
                     if (val > 32767) val = 32767;
                     if (val < -32768) val = -32768;
                     int16View[i] = val;
                 }
-                // rawData reflects changes because it shares the buffer
              }
-
              buffers.push(rawData);
              totalLength += rawData.length;
         }
@@ -467,13 +497,10 @@ function App() {
   const completedCount = activeProject.segments.filter(s => s.status === SegmentStatus.COMPLETED).length;
   const hasCompleted = completedCount > 0;
   
-  // Computed values for UI
   const selectedCount = activeProject.segments.filter(s => s.isSelected).length;
   const allSelected = activeProject.segments.length > 0 && selectedCount === activeProject.segments.length;
   const isIndeterminate = selectedCount > 0 && !allSelected;
   
-  // Determine slider display value: 
-  // If selection, use first selected vol. If no selection, use first vol. Default 1.0.
   let displayVolume = 1.0;
   const targetSegments = selectedCount > 0 ? activeProject.segments.filter(s => s.isSelected) : activeProject.segments;
   if (targetSegments.length > 0) {
@@ -555,9 +582,18 @@ function App() {
                 01733263106
                 </p>
             </div>
-            <div className="text-right">
-                <span className="text-xs font-mono text-slate-500 block uppercase tracking-wider">Current Project</span>
-                <span className="text-sm font-semibold text-blue-300">{activeProject.name}</span>
+            <div className="flex flex-col items-end gap-2">
+                <div className="text-right">
+                    <span className="text-xs font-mono text-slate-500 block uppercase tracking-wider">Current Project</span>
+                    <span className="text-sm font-semibold text-blue-300">{activeProject.name}</span>
+                </div>
+                <button 
+                  onClick={() => setShowSettings(true)}
+                  className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-blue-400 transition-colors bg-slate-900 hover:bg-slate-800 px-2 py-1 rounded border border-slate-700"
+                >
+                   <Settings size={14} />
+                   <span>Settings</span>
+                </button>
             </div>
           </header>
 
@@ -583,7 +619,7 @@ function App() {
                         className={`p-2 rounded border border-slate-700 ${
                             previewAudio ? 'bg-amber-900/30 text-amber-500 border-amber-800' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white'
                         } transition-colors cursor-pointer`}
-                        title="Preview Voice (Hello, I am your selected voice)"
+                        title="Preview Voice"
                     >
                         {isPreviewLoading ? (
                             <Loader2 size={18} className="animate-spin" />
@@ -818,6 +854,59 @@ function App() {
           </div>
         </div>
       </div>
+
+      {/* API Key Settings Modal */}
+      {showSettings && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl p-6 w-full max-w-md shadow-2xl relative animate-in fade-in zoom-in duration-200">
+            <button 
+              onClick={() => setShowSettings(false)}
+              className="absolute top-4 right-4 text-slate-500 hover:text-white"
+            >
+              <X size={20} />
+            </button>
+            
+            <h2 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
+              <Settings className="text-blue-400" /> API Configuration
+            </h2>
+            
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-400 mb-1">
+                  Custom Gemini API Keys (Bulk)
+                </label>
+                <textarea 
+                  value={apiKeyInput}
+                  onChange={(e) => setApiKeyInput(e.target.value)}
+                  placeholder="AIzaSy... (Key 1)&#10;AIzaSy... (Key 2)&#10;AIzaSy... (Key 3)"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-2 text-white focus:ring-2 focus:ring-blue-500 outline-none font-mono text-sm h-32 resize-none leading-relaxed"
+                />
+                <div className="flex justify-between items-start mt-2">
+                    <p className="text-xs text-slate-500">
+                    Enter one key per line. The app will cycle through them automatically to distribute the load.
+                    </p>
+                    <span className="text-xs text-blue-400 bg-blue-900/20 px-2 py-0.5 rounded border border-blue-900/50 whitespace-nowrap">
+                        {apiKeyInput.split('\n').filter(k => k.trim()).length} keys loaded
+                    </span>
+                </div>
+              </div>
+              
+              <div className="bg-blue-900/20 border border-blue-900/50 rounded-lg p-3 text-xs text-blue-200">
+                Don't have a key? Get one for free at <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="underline hover:text-white">Google AI Studio</a>.
+              </div>
+
+              <div className="flex justify-end pt-2">
+                <button 
+                  onClick={saveApiKeys}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition-colors cursor-pointer"
+                >
+                  Save & Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
